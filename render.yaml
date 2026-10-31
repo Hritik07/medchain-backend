@@ -1,0 +1,78 @@
+# Render Blueprint for the MedChain API (free tier, hackathon demo).
+# Render reads this from the repo root: New -> Blueprint -> pick this repo. See infra/render.md.
+# Values marked sync: false are entered by you in the Render dashboard (never commit secrets here).
+
+services:
+  - type: web
+    name: medchain-api
+    runtime: docker
+    plan: free
+    region: singapore                    # closest Render region to India
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: ./apps/api
+    healthCheckPath: /health/live        # fast liveness check (doesn't wait on Mongo/Solana)
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY                 # Render's router sits in front: use real client IPs for rate limits
+        value: "true"
+
+      # --- Database (Render Postgres below; internal URL, so no SSL needed) ---
+      - key: DATABASE_URL
+        fromDatabase:
+          name: medchain-db
+          property: connectionString
+      - key: DATABASE_SSL
+        value: "false"                   # set "true" if you switch DATABASE_URL to YugabyteDB Aeon / an external URL
+      - key: RUN_MIGRATIONS_ON_START     # no shell on the free tier, so the API migrates itself on boot
+        value: "true"
+      - key: SEED_DEMO_DATA              # fake demo accounts (Demo@1234); idempotent
+        value: "true"
+      - key: DEMO_MODE                   # accepts OTP 123456 for judges. Hackathon demo ONLY.
+        value: "true"
+
+      # --- Secrets generated once by Render (do NOT change IDENTIFIER_SALT later: patient lookups depend on it) ---
+      - key: JWT_SECRET
+        generateValue: true
+      - key: IDENTIFIER_SALT
+        generateValue: true
+      - key: SERVICE_API_KEY             # share with Member 2 for n8n (x-service-key header)
+        generateValue: true
+
+      # --- Entered by you in the dashboard ---
+      - key: MONGO_URI                   # MongoDB Atlas connection string
+        sync: false
+      - key: MONGO_DB_NAME
+        value: medchain
+      - key: API_PUBLIC_URL              # https://<service-name>.onrender.com (links handed to n8n)
+        sync: false
+      - key: SOLANA_SERVICE_URL          # Member 3's service URL
+        sync: false
+      - key: SOLANA_SERVICE_API_KEY
+        sync: false
+      - key: N8N_UPLOAD_WEBHOOK_URL      # Member 2's n8n webhook (optional)
+        sync: false
+      - key: CORS_ORIGIN                 # frontend URL, e.g. https://medchain-web.onrender.com ("*" while testing)
+        value: "*"
+
+      # --- File storage: Render's free disk is wiped on restart, so use S3-compatible storage for real demos ---
+      - key: STORAGE_DRIVER              # "local" works until the next restart; switch to "s3" once S3_* are filled
+        value: local
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        value: us-east-1
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+
+databases:
+  - name: medchain-db
+    plan: free                           # 1 GB, expires 30 days after creation (fine for a hackathon)
+    region: singapore                    # must match the web service for the internal URL
+    databaseName: medchain
+    user: medchain

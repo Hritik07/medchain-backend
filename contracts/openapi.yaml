@@ -1,0 +1,1269 @@
+openapi: 3.0.3
+info:
+  title: MedChain API
+  version: 1.0.0
+  description: |
+    Consent-based lifelong medical timeline. Owner: Member 1 (backend & databases).
+
+    - **Auth:** `Authorization: Bearer <JWT>` (8h). Patients log in by OTP; staff by email + password.
+    - **Errors:** every failure returns `{ "error": { "code", "message", "details"? } }`. Branch on `code`.
+    - **Consent:** doctor/pharmacy/diagnostic can read or upload a patient's records only with an active
+      (unexpired, unrevoked) grant. Every records call is written to the patient's access log.
+    - **Internal routes** (tag `internal`) are for n8n only and use the `x-service-key` header.
+      Frontend clients should ignore them.
+    - Dev only: OTP is printed in the server console and `123456` is always accepted.
+servers:
+  - url: http://localhost:4000
+    description: Local development
+  - url: https://api.example.com
+    description: Production on Vultr (replace with the real domain in Step 12)
+
+tags:
+  - name: health
+  - name: auth
+    description: Staff login and session
+  - name: patient-auth
+    description: Patient register / login with OTP
+  - name: consent
+  - name: records
+  - name: access-log
+  - name: patients
+    description: Patient settings (WhatsApp link, chat history erasure)
+  - name: providers
+  - name: admin
+  - name: internal
+    description: n8n / WhatsApp bot only (x-service-key). Not for the frontend.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Service status
+      security: []
+      responses:
+        '200':
+          description: API and databases reachable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: YugabyteDB unreachable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /health/live:
+    get:
+      tags: [health]
+      summary: Liveness (instant, no dependency checks) for hosting health checks
+      security: []
+      responses:
+        '200':
+          description: Process is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, time]
+                properties:
+                  status: { type: string, enum: [alive] }
+                  time: { type: string, format: date-time }
+
+  # ---------------------------------------------------------------- staff auth
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Staff / admin login (email + password)
+      description: Rate limit 10 per 10 min per IP. Staff of an unverified provider get 403 PROVIDER_NOT_VERIFIED.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: doctor@medchain.demo }
+                password: { type: string, example: Demo@1234 }
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: Current user
+      responses:
+        '200':
+          description: The logged-in user
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, role, name, providerId]
+                properties:
+                  id: { type: string, format: uuid }
+                  role: { $ref: '#/components/schemas/Role' }
+                  name: { type: string, nullable: true }
+                  providerId: { type: string, format: uuid, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # ---------------------------------------------------------------- patient auth
+  /api/v1/auth/patient/register:
+    post:
+      tags: [patient-auth]
+      summary: Start patient self-registration (sends OTP)
+      description: The 12-digit identifier is hashed immediately and never stored or returned.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, name, mobile]
+              properties:
+                identifier: { type: string, description: '12 digits; spaces/dashes allowed', example: '000000000009' }
+                name: { type: string, minLength: 2, maxLength: 100, example: Test Patient }
+                mobile: { type: string, description: 'Indian mobile, e.g. 9999900009 or +919999900009', example: '9999900009' }
+      responses:
+        '201':
+          description: OTP sent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OtpSent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/patient/register/verify:
+    post:
+      tags: [patient-auth]
+      summary: Complete registration with the OTP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerifyRequest' }
+      responses:
+        '201':
+          description: Patient created and logged in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/patient/login:
+    post:
+      tags: [patient-auth]
+      summary: Patient login (sends OTP to registered mobile)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier]
+              properties:
+                identifier: { type: string, example: '000000000001' }
+      responses:
+        '200':
+          description: OTP sent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OtpSent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/patient/login/verify:
+    post:
+      tags: [patient-auth]
+      summary: Complete patient login with the OTP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerifyRequest' }
+      responses:
+        '200':
+          description: Logged in. `user.id` is the patientId for the records endpoints.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  # ---------------------------------------------------------------- consent
+  /api/v1/consent:
+    get:
+      tags: [consent]
+      summary: List grants (patient = grants on me, staff = grants I hold)
+      responses:
+        '200':
+          description: Newest first, max 100
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: '#/components/schemas/Grant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/consent/request:
+    post:
+      tags: [consent]
+      summary: Staff asks a patient for consent (OTP to the patient's mobile)
+      description: Roles doctor, pharmacy, diagnostic.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier]
+              properties:
+                identifier: { type: string, example: '000000000001' }
+                purpose: { type: string, minLength: 3, maxLength: 100, default: treatment }
+                durationHours: { type: integer, minimum: 1, maximum: 72, default: 24 }
+      responses:
+        '201':
+          description: OTP sent to the patient
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OtpSent'
+                  - type: object
+                    required: [durationHours, purpose]
+                    properties:
+                      durationHours: { type: integer }
+                      purpose: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/consent/verify:
+    post:
+      tags: [consent]
+      summary: Staff submits the patient's OTP to create the grant
+      description: Must be the same staff user who requested it (else 403 OTP_NOT_YOURS). The grant hash is anchored on Solana.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerifyRequest' }
+      responses:
+        '201':
+          description: Grant created (includes patientName)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Grant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/consent/check/{patientId}:
+    get:
+      tags: [consent]
+      summary: Does the calling staff user have active access to this patient?
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      responses:
+        '200':
+          description: Active grant
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [active, grant]
+                properties:
+                  active: { type: boolean, enum: [true] }
+                  grant: { $ref: '#/components/schemas/Grant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+
+  /api/v1/consent/{grantId}/revoke:
+    post:
+      tags: [consent]
+      summary: Revoke a grant (patient, the staff holder, or admin)
+      parameters:
+        - $ref: '#/components/parameters/GrantId'
+      responses:
+        '200':
+          description: Revoked grant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Grant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/consent/{grantId}/chain-verify:
+    get:
+      tags: [consent]
+      summary: Re-check the consent hash on Solana
+      parameters:
+        - $ref: '#/components/parameters/GrantId'
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChainVerifyResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- records
+  /api/v1/records/{patientId}/entries:
+    post:
+      tags: [records]
+      summary: Upload a record (patient for self, or staff with active consent)
+      description: |
+        JPG/PNG/WebP/PDF, max 10 MB. Images are converted to WebP (quality 90, metadata stripped).
+        Patient uploads are labelled "Patient-uploaded, unverified". Rate limit 30 per 10 min.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { $ref: '#/components/schemas/UploadForm' }
+      responses:
+        '201':
+          description: Stored, hashed, sent to the AI pipeline
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/records/{patientId}/timeline:
+    get:
+      tags: [records]
+      summary: Patient timeline, newest first, abnormal lab values flagged
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+        - name: type
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/RecordType' }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 200 }
+      responses:
+        '200':
+          description: Timeline
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Timeline' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+
+  /api/v1/records/{patientId}/entries/{entryId}:
+    get:
+      tags: [records]
+      summary: One record
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+        - $ref: '#/components/parameters/EntryId'
+      responses:
+        '200':
+          description: Record
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/records/{patientId}/entries/{entryId}/file:
+    get:
+      tags: [records]
+      summary: The stored file (binary)
+      description: Needs the Authorization header, so fetch as a blob and use URL.createObjectURL.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+        - $ref: '#/components/parameters/EntryId'
+      responses:
+        '200':
+          description: File bytes
+          content:
+            image/webp:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/records/{patientId}/entries/{entryId}/verify:
+    get:
+      tags: [records]
+      summary: Re-hash the stored file and check it against Solana (badge)
+      description: |
+        Badge rule: Verified only if status == "verified" AND storedFileIntact == true;
+        Tampered if status == "mismatch" OR storedFileIntact == false; otherwise Not recorded / Pending.
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+        - $ref: '#/components/parameters/EntryId'
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ChainVerifyResult'
+                  - type: object
+                    required: [storedFileIntact]
+                    properties:
+                      storedFileIntact: { type: boolean }
+        '403': { $ref: '#/components/responses/ConsentDenied' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- access log
+  /api/v1/access-log:
+    get:
+      tags: [access-log]
+      summary: Who viewed my records (patient) / any patient's log (admin)
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: before
+          in: query
+          description: Pass the previous response's nextBefore to get the next page
+          schema: { type: string, format: date-time }
+        - name: includeSelf
+          in: query
+          description: Include the patient's own views
+          schema: { type: string, enum: ['true', 'false'], default: 'false' }
+        - name: patientId
+          in: query
+          description: Admin only (required for admin)
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [patientId, entries, nextBefore]
+                properties:
+                  patientId: { type: string, format: uuid }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/AccessLogEntry' }
+                  nextBefore: { type: string, format: date-time, nullable: true }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- patient settings
+  /api/v1/patients/me/whatsapp:
+    get:
+      tags: [patients]
+      summary: Linked WhatsApp number (masked)
+      responses:
+        '200':
+          description: Link status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppLink' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [patients]
+      summary: Unlink WhatsApp
+      responses:
+        '200':
+          description: Unlinked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppLink' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/patients/me/whatsapp/link:
+    post:
+      tags: [patients]
+      summary: Start linking a WhatsApp number (OTP to that number)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mobile]
+              properties:
+                mobile: { type: string, example: '9999900001' }
+      responses:
+        '201':
+          description: OTP sent
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OtpSent' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/patients/me/whatsapp/verify:
+    post:
+      tags: [patients]
+      summary: Confirm the WhatsApp number with the OTP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerifyRequest' }
+      responses:
+        '200':
+          description: Linked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppLink' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Gone' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/patients/me/chat-history:
+    delete:
+      tags: [patients]
+      summary: Erase the fallback chatbot history (right to erasure)
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ---------------------------------------------------------------- providers
+  /api/v1/providers/register:
+    post:
+      tags: [providers]
+      summary: Clinic / pharmacy / lab sign-up (starts pending)
+      description: Rate limit 5 per hour per IP. Staff can log in only after an admin verifies the provider.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderRegisterRequest' }
+      responses:
+        '201':
+          description: Registered, awaiting verification
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, message]
+                properties:
+                  provider: { $ref: '#/components/schemas/Provider' }
+                  message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/providers/me:
+    get:
+      tags: [providers]
+      summary: My organisation (staff)
+      responses:
+        '200':
+          description: Provider
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Provider' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin/providers:
+    get:
+      tags: [admin]
+      summary: Provider verification queue
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [pending, verified, rejected, all], default: pending }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/ProviderType' }
+      responses:
+        '200':
+          description: Newest first, max 200
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [providers]
+                properties:
+                  providers:
+                    type: array
+                    items: { $ref: '#/components/schemas/Provider' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/admin/providers/{providerId}/verify:
+    post:
+      tags: [admin]
+      summary: Approve a provider
+      parameters:
+        - $ref: '#/components/parameters/ProviderId'
+      responses:
+        '200':
+          description: Verified
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Provider' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/admin/providers/{providerId}/reject:
+    post:
+      tags: [admin]
+      summary: Reject a pending provider or suspend a verified one (effective immediately)
+      parameters:
+        - $ref: '#/components/parameters/ProviderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3, maxLength: 300 }
+      responses:
+        '200':
+          description: Rejected
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Provider' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------- internal (n8n)
+  /api/v1/internal/files/{entryId}:
+    get:
+      tags: [internal]
+      summary: n8n downloads a stored file for AI parsing
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/EntryId'
+      responses:
+        '200':
+          description: File bytes
+          content:
+            image/webp:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/internal/records/{entryId}/parsed:
+    post:
+      tags: [internal]
+      summary: n8n posts the AI extraction; the API computes High/Low from the printed range
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/EntryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ParsedCallback' }
+      responses:
+        '200':
+          description: Stored and flagged
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entryId, processingStatus, tests, abnormal]
+                properties:
+                  entryId: { type: string }
+                  processingStatus: { type: string, enum: [processed, failed] }
+                  tests: { type: integer }
+                  abnormal:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        status: { type: string, enum: [high, low] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/internal/whatsapp/resolve:
+    post:
+      tags: [internal]
+      summary: Map a WhatsApp number to a patient (verified links only)
+      description: Accepts "whatsapp:+919999900001" (Twilio) or "919999900001" (Meta). Phone goes in the body, never the URL.
+      security: [{ serviceKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, example: 'whatsapp:+919999900001' }
+      responses:
+        '200':
+          description: Linked patient
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [patientId, name]
+                properties:
+                  patientId: { type: string, format: uuid }
+                  name: { type: string, nullable: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/internal/patients/{patientId}/timeline:
+    get:
+      tags: [internal]
+      summary: Patient's own timeline for the WhatsApp bot (logged as a self-view)
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      responses:
+        '200':
+          description: Timeline
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Timeline' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/internal/patients/{patientId}/entries:
+    post:
+      tags: [internal]
+      summary: Upload a photo/PDF received on WhatsApp ("Patient-uploaded, unverified")
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                type: { $ref: '#/components/schemas/RecordType' }
+                title: { type: string, maxLength: 200 }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Entry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+
+  /api/v1/internal/patients/{patientId}/chat-history:
+    get:
+      tags: [internal]
+      summary: Fallback chat memory (when Meko is down), oldest first
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages]
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      type: object
+                      required: [role, message, createdAt]
+                      properties:
+                        role: { type: string, enum: [user, assistant, system] }
+                        message: { type: string }
+                        createdAt: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [internal]
+      summary: Append a chat message (keeps the latest 200)
+      security: [{ serviceKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PatientId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role, message]
+              properties:
+                role: { type: string, enum: [user, assistant, system] }
+                message: { type: string, minLength: 1, maxLength: 4000 }
+      responses:
+        '201':
+          description: Saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    serviceKey:
+      type: apiKey
+      in: header
+      name: x-service-key
+      description: Shared secret for n8n (SERVICE_API_KEY). Internal routes only.
+
+  parameters:
+    PatientId:
+      name: patientId
+      in: path
+      required: true
+      description: Patient's user id (UUID). For a patient, their own `user.id`.
+      schema: { type: string, format: uuid }
+    EntryId:
+      name: entryId
+      in: path
+      required: true
+      description: Timeline entry id (24-char hex)
+      schema: { type: string, pattern: '^[0-9a-fA-F]{24}$' }
+    GrantId:
+      name: grantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ProviderId:
+      name: providerId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: |
+        VALIDATION_ERROR, INVALID_JSON, INVALID_IDENTIFIER, INVALID_MOBILE, INVALID_DURATION, OTP_INVALID
+        (details.attemptsLeft), FILE_REQUIRED, INVALID_IMAGE, UPLOAD_ERROR, PATIENT_ID_REQUIRED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: AUTH_REQUIRED, INVALID_TOKEN, TOKEN_EXPIRED, INVALID_CREDENTIALS, USER_NOT_FOUND, INVALID_SERVICE_KEY
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: FORBIDDEN_ROLE, PROVIDER_NOT_VERIFIED, OTP_NOT_YOURS, NOT_YOUR_RECORDS
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ConsentDenied:
+      description: |
+        CONSENT_REQUIRED, CONSENT_EXPIRED, CONSENT_REVOKED (staff without an active grant),
+        NOT_YOUR_RECORDS (patient accessing someone else), FORBIDDEN_ROLE, PROVIDER_NOT_VERIFIED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        NOT_FOUND, PATIENT_NOT_REGISTERED, PATIENT_NOT_FOUND, OTP_NOT_FOUND, CONSENT_NOT_FOUND,
+        RECORD_NOT_FOUND, FILE_NOT_FOUND, PROVIDER_NOT_FOUND, PHONE_NOT_LINKED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        PATIENT_ALREADY_REGISTERED, NO_MOBILE_ON_FILE, OTP_ALREADY_USED, CONSENT_ALREADY_REVOKED,
+        CONSENT_ALREADY_EXPIRED, PHONE_LINKED_TO_ANOTHER_PATIENT, EMAIL_ALREADY_REGISTERED, PROVIDER_ALREADY_VERIFIED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Gone:
+      description: OTP_EXPIRED
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: FILE_TOO_LARGE
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    UnsupportedMediaType:
+      description: UNSUPPORTED_FILE_TYPE
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: RATE_LIMITED, OTP_COOLDOWN, OTP_SEND_LIMIT, OTP_LOCKED (details.retryAfterSeconds where known)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: CONSENT_EXPIRED }
+            message: { type: string }
+            details: {}
+
+    Role:
+      type: string
+      enum: [patient, doctor, pharmacy, diagnostic, admin]
+
+    ProviderType:
+      type: string
+      enum: [doctor, pharmacy, diagnostic]
+
+    RecordType:
+      type: string
+      enum: [prescription, pharmacy_bill, lab_report, visit_note, other]
+
+    ChainStatus:
+      type: string
+      enum: [confirmed, chain_pending, not_recorded]
+      description: not_recorded = Solana service unreachable; the API retries in the background.
+
+    ChainInfo:
+      type: object
+      required: [status, solanaTx]
+      properties:
+        status: { $ref: '#/components/schemas/ChainStatus' }
+        solanaTx: { type: string, nullable: true }
+
+    ChainVerifyResult:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [verified, mismatch, not-found, not-recorded, unavailable]
+        timestamp: { type: string }
+        chainStatus: { $ref: '#/components/schemas/ChainStatus' }
+      additionalProperties: true
+
+    AuthUser:
+      type: object
+      required: [id, role, providerId, name]
+      properties:
+        id: { type: string, format: uuid }
+        role: { $ref: '#/components/schemas/Role' }
+        providerId: { type: string, format: uuid, nullable: true }
+        name: { type: string, nullable: true }
+
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token: { type: string }
+        user: { $ref: '#/components/schemas/AuthUser' }
+
+    OtpSent:
+      type: object
+      required: [otpId, expiresAt, sentTo]
+      properties:
+        otpId: { type: string, format: uuid }
+        expiresAt: { type: string, format: date-time }
+        sentTo: { type: string, description: 'Masked mobile', example: '+91XXXXXX0001' }
+
+    OtpVerifyRequest:
+      type: object
+      required: [otpId, code]
+      properties:
+        otpId: { type: string, format: uuid }
+        code: { type: string, pattern: '^\d{6}$', example: '123456' }
+
+    Grant:
+      type: object
+      required: [id, patientId, accessorId, purpose, state, grantedAt, expiresAt, revokedAt, chain, revokeChain]
+      properties:
+        id: { type: string, format: uuid }
+        patientId: { type: string, format: uuid }
+        accessorId: { type: string, format: uuid }
+        purpose: { type: string }
+        state: { type: string, enum: [active, expired, revoked] }
+        grantedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        revokedAt: { type: string, format: date-time, nullable: true }
+        chain: { $ref: '#/components/schemas/ChainInfo' }
+        revokeChain:
+          allOf: [{ $ref: '#/components/schemas/ChainInfo' }]
+          nullable: true
+        patientName: { type: string, nullable: true, description: 'Staff views only' }
+        accessorName: { type: string, nullable: true, description: 'Patient view only' }
+        accessorRole: { $ref: '#/components/schemas/Role' }
+        providerName: { type: string, nullable: true, description: 'Patient view only' }
+
+    LabTest:
+      type: object
+      required: [name, value, unit, rangeLow, rangeHigh, status, abnormal, confidence]
+      properties:
+        name: { type: string, example: Haemoglobin }
+        value:
+          oneOf: [{ type: number }, { type: string }]
+        unit: { type: string, nullable: true }
+        rangeLow: { type: number, nullable: true, description: 'Printed on the report' }
+        rangeHigh: { type: number, nullable: true, description: 'Printed on the report' }
+        status: { type: string, enum: [high, low, normal, unknown], description: 'Computed by code, not AI' }
+        abnormal: { type: boolean }
+        confidence: { type: number, nullable: true }
+
+    Entry:
+      type: object
+      required: [id, patientId, type, title, date, source, verified, sourceLabel, uploadedBy, file, docHash, chain, processingStatus, extracted, labResults, createdAt]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{24}$' }
+        patientId: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/RecordType' }
+        title: { type: string, nullable: true }
+        date: { type: string, format: date-time }
+        source: { type: string, enum: [provider, patient_uploaded] }
+        verified: { type: boolean }
+        sourceLabel: { type: string, example: 'Patient-uploaded, unverified' }
+        uploadedBy:
+          type: object
+          required: [role, providerName]
+          properties:
+            role: { $ref: '#/components/schemas/Role' }
+            providerName: { type: string, nullable: true }
+        file:
+          type: object
+          required: [mime, size, originalName]
+          properties:
+            mime: { type: string, enum: [image/webp, application/pdf] }
+            size: { type: integer }
+            originalName: { type: string }
+        docHash: { type: string, description: 'SHA-256 hex of the stored file' }
+        chain: { $ref: '#/components/schemas/ChainInfo' }
+        processingStatus: { type: string, enum: [pending, processed, failed, skipped] }
+        extracted:
+          type: object
+          nullable: true
+          additionalProperties: true
+        labResults:
+          type: object
+          nullable: true
+          required: [tests, abnormalCount]
+          properties:
+            tests:
+              type: array
+              items: { $ref: '#/components/schemas/LabTest' }
+            abnormalCount: { type: integer }
+        createdAt: { type: string, format: date-time }
+
+    Timeline:
+      type: object
+      required: [patientId, count, abnormalCount, entries]
+      properties:
+        patientId: { type: string, format: uuid }
+        count: { type: integer }
+        abnormalCount: { type: integer }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/Entry' }
+
+    UploadForm:
+      type: object
+      required: [file, type]
+      properties:
+        file: { type: string, format: binary, description: 'JPG, PNG, WebP or PDF; max 10 MB' }
+        type: { $ref: '#/components/schemas/RecordType' }
+        title: { type: string, maxLength: 200 }
+        date: { type: string, format: date, description: 'Date of the document; defaults to today' }
+
+    AccessLogEntry:
+      type: object
+      required: [id, viewedAt, action, recordIds, accessor, consent, chain]
+      properties:
+        id: { type: string, format: uuid }
+        viewedAt: { type: string, format: date-time }
+        action: { type: string, enum: [view_timeline, view_record, view_file, verify_record, upload] }
+        recordIds:
+          type: array
+          items: { type: string }
+        accessor:
+          type: object
+          required: [id, name, role, providerName]
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string, nullable: true, description: '"You" for the patient\''s own views' }
+            role: { $ref: '#/components/schemas/Role' }
+            providerName: { type: string, nullable: true }
+        consent:
+          type: object
+          nullable: true
+          properties:
+            grantId: { type: string, format: uuid }
+            purpose: { type: string, nullable: true }
+        chain:
+          type: object
+          required: [status, solanaTx]
+          properties:
+            status:
+              type: string
+              nullable: true
+              enum: [confirmed, chain_pending, not_recorded, null]
+              description: null = not anchored by design (patient's own views)
+            solanaTx: { type: string, nullable: true }
+
+    WhatsAppLink:
+      type: object
+      required: [linked]
+      properties:
+        linked: { type: boolean }
+        phone: { type: string, nullable: true, example: '+91XXXXXX0001' }
+        verifiedAt: { type: string, format: date-time, nullable: true }
+
+    Provider:
+      type: object
+      required: [id, type, name, registrationNumber, verifiedStatus, verifiedAt, rejectionReason, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/ProviderType' }
+        name: { type: string }
+        registrationNumber: { type: string, nullable: true }
+        verifiedStatus: { type: string, enum: [pending, verified, rejected] }
+        verifiedAt: { type: string, format: date-time, nullable: true }
+        rejectionReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        contact:
+          type: object
+          description: Admin listing only
+          properties:
+            name: { type: string, nullable: true }
+            email: { type: string, nullable: true }
+        staffCount: { type: integer, description: Admin listing only }
+
+    ProviderRegisterRequest:
+      type: object
+      required: [type, organisationName, registrationNumber, staff]
+      properties:
+        type: { $ref: '#/components/schemas/ProviderType' }
+        organisationName: { type: string, minLength: 3, maxLength: 150 }
+        registrationNumber: { type: string, minLength: 3, maxLength: 60 }
+        staff:
+          type: object
+          required: [name, email, password]
+          properties:
+            name: { type: string, minLength: 2, maxLength: 100 }
+            email: { type: string, format: email }
+            password: { type: string, minLength: 8, maxLength: 72, description: 'At least one letter and one number' }
+            mobile: { type: string }
+
+    ParsedCallback:
+      type: object
+      properties:
+        status: { type: string, enum: [processed, failed], default: processed }
+        error: { type: string, maxLength: 500 }
+        extracted:
+          type: object
+          additionalProperties: true
+        tests:
+          type: array
+          maxItems: 300
+          items:
+            type: object
+            required: [name, value]
+            properties:
+              name: { type: string }
+              value:
+                oneOf: [{ type: number }, { type: string }]
+              unit: { type: string, nullable: true }
+              range_low:
+                oneOf: [{ type: number }, { type: string }]
+                nullable: true
+              range_high:
+                oneOf: [{ type: number }, { type: string }]
+                nullable: true
+              confidence: { type: number, minimum: 0, maximum: 1, nullable: true }
+
+    Health:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        env: { type: string }
+        demoMode: { type: boolean, description: 'true = hosted demo accepting OTP 123456' }
+        services:
+          type: object
+          properties:
+            yugabyte: { type: string, enum: [up, down] }
+            mongo: { type: string, enum: [up, down, not_configured] }
+            solana:
+              type: object
+              properties:
+                status: { type: string, enum: [not_configured, reachable, unauthorized, unreachable] }
+                detail: { type: string }
+        time: { type: string, format: date-time }

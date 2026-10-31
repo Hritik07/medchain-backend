@@ -1,0 +1,50 @@
+# Local development stack: the API + a Postgres container standing in for YugabyteDB (both speak YSQL/Postgres).
+# Run from the repo root:  docker compose up --build
+# MongoDB Atlas, n8n and the Solana service are external; their URLs come from apps/api/.env.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: medchain
+      POSTGRES_PASSWORD: medchain_dev_pw   # dev only, fake
+      POSTGRES_DB: medchain
+    ports:
+      - "5433:5432"   # 5433 on your machine so it won't clash with a local Postgres
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medchain -d medchain"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./apps/api
+    env_file: ./apps/api/.env
+    environment:
+      # Inside Docker the DB is reachable by service name, not localhost.
+      DATABASE_URL: postgres://medchain:medchain_dev_pw@db:5432/medchain
+      NODE_ENV: development
+      STORAGE_DIR: /app/storage
+    ports:
+      - "4000:4000"
+    volumes:
+      - filestore:/app/storage   # uploaded files survive container rebuilds (local storage mode)
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Optional: real YugabyteDB locally instead of Postgres (heavier, ~1GB RAM).
+  # Start with:  docker compose --profile yugabyte up yugabyte
+  # Then set DATABASE_URL=postgres://yugabyte@localhost:5434/yugabyte
+  yugabyte:
+    image: yugabytedb/yugabyte:2024.2.0.0-b145
+    command: ["bin/yugabyted", "start", "--background=false"]
+    ports:
+      - "5434:5433"
+      - "15433:15433"
+    profiles: ["yugabyte"]
+
+volumes:
+  dbdata:
+  filestore:
